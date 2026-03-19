@@ -1,0 +1,15 @@
+services:
+  workspace:
+    build: .
+    image: autocheck-mcp:latest
+    container_name: autocheck-workspace
+    # stdio MCP 不需要端口，保持容器常驻
+    stdin_open: true
+    tty: false
+    # 用户代码挂载进来
+    volumes:
+      - ./workspace:/workspace
+    # 容器不自动重启，由 MCP 客户端 docker exec 唤起
+    restart: "no"
+    # 不跑 entrypoint，只是让容器保持存活
+    entrypoint: ["sleep", "infinity"]
