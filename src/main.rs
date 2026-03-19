@@ -2,7 +2,8 @@ use ds_api::{McpServer, ToolBundle, tool};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
@@ -75,8 +76,9 @@ fn truncate_output(s: String) -> Value {
 
 // ── bash execution ────────────────────────────────────────────────────────────
 
-fn run_bash(command: &str, timeout_ms: u64) -> Value {
-    use std::time::{Duration, Instant};
+async fn run_bash(command: &str, timeout_ms: u64) -> Value {
+    use tokio::io::AsyncReadExt;
+    use tokio::time::{Duration, sleep};
 
     #[cfg(windows)]
     let (prog, args) = ("cmd", vec!["/C", command]);
@@ -96,43 +98,42 @@ fn run_bash(command: &str, timeout_ms: u64) -> Value {
         Err(e) => return json!({ "error": format!("spawn failed: {e}") }),
     };
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
 
-    // 在单独线程里等待，主线程 sleep-poll 以支持超时
+    let read_all = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        tokio::join!(
+            async {
+                let _ = stdout.read_to_end(&mut out).await;
+            },
+            async {
+                let _ = stderr.read_to_end(&mut err).await;
+            },
+        );
+        (out, err)
+    };
 
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // 已退出，收集输出
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut o) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_end(&mut o, &mut stdout);
-                }
-                if let Some(mut e) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_end(&mut e, &mut stderr);
-                }
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr),
-                );
-                let mut r = truncate_output(combined);
-                r["exit_code"] = json!(status.code());
-                r["timed_out"] = json!(false);
-                break r;
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    break json!({
-                        "error": format!("timed out after {timeout_ms}ms"),
-                        "timed_out": true,
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => break json!({ "error": format!("wait failed: {e}") }),
+    tokio::select! {
+        (stdout_bytes, stderr_bytes) = read_all => {
+            let exit_code = child.wait().await.ok().and_then(|s| s.code());
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&stdout_bytes),
+                String::from_utf8_lossy(&stderr_bytes),
+            );
+            let mut r = truncate_output(combined);
+            r["exit_code"] = json!(exit_code);
+            r["timed_out"] = json!(false);
+            r
+        }
+        _ = sleep(Duration::from_millis(timeout_ms)) => {
+            let _ = child.kill().await;
+            json!({
+                "error": format!("timed out after {timeout_ms}ms"),
+                "timed_out": true,
+            })
         }
     }
 }
@@ -259,7 +260,7 @@ fn make_diff(path: &str, before: &str, after: &str) -> String {
 
 // ── run executable ────────────────────────────────────────────────────────────
 
-fn run_executable(path: &str) -> Value {
+async fn run_executable(path: &str) -> Value {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -269,19 +270,20 @@ fn run_executable(path: &str) -> Value {
             let _ = std::fs::set_permissions(path, perms);
         }
     }
-    run_bash(path, DEFAULT_TIMEOUT_MS)
+    run_bash(path, DEFAULT_TIMEOUT_MS).await
 }
 
 // ── autocheck ─────────────────────────────────────────────────────────────────
 
-fn run_check_in_root(root: &Path) -> Value {
+async fn run_check_in_root(root: &Path) -> Value {
     let path_env = cargo_path_env();
 
     let fix = Command::new("cargo")
         .args(["clippy", "--fix", "--allow-dirty"])
         .current_dir(root)
         .env("PATH", &path_env)
-        .output();
+        .output()
+        .await;
     let (clippy_ok, _clippy_stderr) = match fix {
         Ok(o) => (
             o.status.success(),
@@ -291,10 +293,12 @@ fn run_check_in_root(root: &Path) -> Value {
     };
 
     let check = Command::new("cargo")
-        .args(["check", "--message-format=human"])
+        .args(["clippy", "--message-format=human"])
         .current_dir(root)
         .env("PATH", &path_env)
-        .output();
+        .output()
+        .await;
+
     let (check_ok, check_stderr) = match check {
         Ok(o) => (
             o.status.success(),
@@ -320,7 +324,7 @@ fn run_check_in_root(root: &Path) -> Value {
     })
 }
 
-fn auto_check(path: &str) -> Value {
+async fn auto_check(path: &str) -> Value {
     let p = Path::new(path);
     let needs_check = p.extension().is_some_and(|e| e == "rs")
         || p.file_name().is_some_and(|n| n == "Cargo.toml");
@@ -330,13 +334,13 @@ fn auto_check(path: &str) -> Value {
     let Some(root) = find_cargo_root(p) else {
         return json!({ "success": null, "summary": format!("skipped: no Cargo.toml above {path}") });
     };
-    run_check_in_root(&root)
+    run_check_in_root(&root).await
 }
 
 // ── tools ─────────────────────────────────────────────────────────────────────
 
 /// 실제 파일 쓰기 로직 (autocheck 없이). write/multiwrite 양쪽에서 호출.
-fn do_write(
+async fn do_write(
     path: &str,
     new_content: String,
     old_string: Option<String>,
@@ -371,7 +375,11 @@ fn do_write(
                 return json!({ "error": format!("write failed: {e}") });
             }
             let diff = make_diff(path, &original, &updated);
-            let run = shebang.as_ref().map(|_| run_executable(path));
+            let run = if shebang.is_some() {
+                Some(run_executable(path).await)
+            } else {
+                None
+            };
             return json!({ "inserted_after": path, "bytes": new_content.len(), "diff": diff, "run": run });
         }
         use std::fs::OpenOptions;
@@ -386,7 +394,11 @@ fn do_write(
         }
         let after = std::fs::read_to_string(path).unwrap_or_default();
         let diff = make_diff(path, &before, &after);
-        let run = shebang.as_ref().map(|_| run_executable(path));
+        let run = if shebang.is_some() {
+            Some(run_executable(path).await)
+        } else {
+            None
+        };
         return json!({ "appended": path, "bytes": new_content.len(), "diff": diff, "run": run });
     }
 
@@ -417,7 +429,11 @@ fn do_write(
             return json!({ "error": format!("write failed: {e}") });
         }
         let diff = make_diff(path, &original, &updated);
-        let run = shebang.as_ref().map(|_| run_executable(path));
+        let run = if shebang.is_some() {
+            Some(run_executable(path).await)
+        } else {
+            None
+        };
         return json!({ "replaced": path, "occurrences": found, "diff": diff, "run": run });
     }
 
@@ -433,7 +449,11 @@ fn do_write(
         return json!({ "error": format!("write failed: {e}") });
     }
     let diff = make_diff(path, &before, &new_content);
-    let run = shebang.as_ref().map(|_| run_executable(path));
+    let run = if shebang.is_some() {
+        Some(run_executable(path).await)
+    } else {
+        None
+    };
     json!({ "written": path, "bytes": new_content.len(), "diff": diff, "run": run })
 }
 
@@ -473,13 +493,14 @@ impl ds_api::Tool for Tools {
             }
 
             // 执行写操作（跳过 autocheck，自己做）
-            let write_result = do_write(&path, new_content, old_string, count, append, shebang);
+            let write_result =
+                do_write(&path, new_content, old_string, count, append, shebang).await;
             results.push(write_result);
         }
 
         // 统一跑一次 cargo check
         let autocheck = match cargo_root {
-            Some(root) => run_check_in_root(&root),
+            Some(root) => run_check_in_root(&root).await,
             None => json!({ "success": null, "summary": "skipped: no Cargo.toml found" }),
         };
 
@@ -490,7 +511,7 @@ impl ds_api::Tool for Tools {
     /// command: the shell command to run
     /// timeout_ms: max milliseconds to wait (default 10000)
     async fn bash(&self, command: String, timeout_ms: Option<u64>) -> Value {
-        run_bash(&command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))
+        run_bash(&command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)).await
     }
 
     /// Write to a file (overwrite / replace / append), then run cargo clippy --fix + cargo check.
@@ -516,8 +537,8 @@ impl ds_api::Tool for Tools {
         append: Option<bool>,
         shebang: Option<String>,
     ) -> Value {
-        let mut result = do_write(&path, new_content, old_string, count, append, shebang);
-        result["autocheck"] = auto_check(&path);
+        let mut result = do_write(&path, new_content, old_string, count, append, shebang).await;
+        result["autocheck"] = auto_check(&path).await;
         result
     }
 }
