@@ -1,8 +1,8 @@
 use ds_api::{McpServer, ToolBundle, tool};
 use serde_json::{Value, json};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::io::Write;
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +53,6 @@ fn cargo_path_env() -> String {
     }
 }
 
-
 // ── output truncation ─────────────────────────────────────────────────────────
 
 fn truncate_output(s: String) -> Value {
@@ -63,7 +62,9 @@ fn truncate_output(s: String) -> Value {
     }
     // 截断到 char boundary
     let mut cut = OUTPUT_LIMIT;
-    while !s.is_char_boundary(cut) { cut -= 1; }
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
     json!({
         "output": &s[..cut],
         "truncated": true,
@@ -137,7 +138,6 @@ fn run_bash(command: &str, timeout_ms: u64) -> Value {
     result
 }
 
-
 // ── diagnostic parsing ────────────────────────────────────────────────────────
 
 fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
@@ -158,7 +158,12 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
             i += 1;
             continue;
         }
-        let message = line.splitn(2, ": ").nth(1).unwrap_or(line).trim().to_string();
+        let message = line
+            .splitn(2, ": ")
+            .nth(1)
+            .unwrap_or(line)
+            .trim()
+            .to_string();
 
         // 找 --> 位置行
         let mut location: Option<(String, usize, usize)> = None;
@@ -175,7 +180,9 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
                 }
                 break;
             }
-            if lines[j].starts_with("error") || lines[j].starts_with("warning") { break; }
+            if lines[j].starts_with("error") || lines[j].starts_with("warning") {
+                break;
+            }
             j += 1;
         }
 
@@ -184,10 +191,13 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
         let mut k = i + 1;
         while k < lines.len() {
             let next = lines[k];
-            let is_new = !next.starts_with(' ') && !next.starts_with('\t')
+            let is_new = !next.starts_with(' ')
+                && !next.starts_with('\t')
                 && (next.starts_with("error") || next.starts_with("warning"))
                 && !next.trim().is_empty();
-            if is_new { break; }
+            if is_new {
+                break;
+            }
             raw_lines.push(next);
             k += 1;
         }
@@ -205,19 +215,27 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
             let center = row.saturating_sub(1);
             let start = center.saturating_sub(5);
             let end = (center + 6).min(total);
-            let snippet: Vec<String> = src_lines[start..end].iter().enumerate().map(|(idx, l)| {
-                let lineno = start + idx + 1;
-                let marker = if lineno == *row { ">>>" } else { "   " };
-                format!("{marker} {lineno:4} | {l}")
-            }).collect();
+            let snippet: Vec<String> = src_lines[start..end]
+                .iter()
+                .enumerate()
+                .map(|(idx, l)| {
+                    let lineno = start + idx + 1;
+                    let marker = if lineno == *row { ">>>" } else { "   " };
+                    format!("{marker} {lineno:4} | {l}")
+                })
+                .collect();
             Some(json!({ "file": rel, "line": row, "snippet": snippet.join("\n") }))
         });
 
         let mut diag = json!({ "level": level, "message": message, "raw": raw_lines.join("\n") });
         if let Some((f, r, c)) = &location {
-            diag["file"] = json!(f); diag["line"] = json!(r); diag["col"] = json!(c);
+            diag["file"] = json!(f);
+            diag["line"] = json!(r);
+            diag["col"] = json!(c);
         }
-        if let Some(ctx) = source_context { diag["source_context"] = ctx; }
+        if let Some(ctx) = source_context {
+            diag["source_context"] = ctx;
+        }
         diags.push(diag);
         i = k;
     }
@@ -239,18 +257,28 @@ fn auto_check(path: &str) -> Value {
     let path_env = cargo_path_env();
 
     let fix = Command::new("cargo")
-        .args(["clippy", "--fix", "--allow-dirty", "--no-vcs"])
-        .current_dir(&root).env("PATH", &path_env).output();
+        .args(["clippy", "--fix", "--allow-dirty"])
+        .current_dir(&root)
+        .env("PATH", &path_env)
+        .output();
     let (clippy_ok, _clippy_stderr) = match fix {
-        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string()),
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ),
         Err(e) => (false, format!("spawn failed: {e}")),
     };
 
     let check = Command::new("cargo")
         .args(["check", "--message-format=human"])
-        .current_dir(&root).env("PATH", &path_env).output();
+        .current_dir(&root)
+        .env("PATH", &path_env)
+        .output();
     let (check_ok, check_stderr) = match check {
-        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string()),
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ),
         Err(e) => (false, format!("spawn failed: {e}")),
     };
 
@@ -270,7 +298,6 @@ fn auto_check(path: &str) -> Value {
         "warnings": warnings,
     })
 }
-
 
 // ── tools ─────────────────────────────────────────────────────────────────────
 
