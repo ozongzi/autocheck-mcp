@@ -99,7 +99,8 @@ fn run_bash(command: &str, timeout_ms: u64) -> Value {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     // 在单独线程里等待，主线程 sleep-poll 以支持超时
-    let result = loop {
+
+    loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // 已退出，收集输出
@@ -133,9 +134,7 @@ fn run_bash(command: &str, timeout_ms: u64) -> Value {
             }
             Err(e) => break json!({ "error": format!("wait failed: {e}") }),
         }
-    };
-
-    result
+    }
 }
 
 // ── diagnostic parsing ────────────────────────────────────────────────────────
@@ -159,8 +158,8 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
             continue;
         }
         let message = line
-            .splitn(2, ": ")
-            .nth(1)
+            .split_once(": ")
+            .map(|x| x.1)
             .unwrap_or(line)
             .trim()
             .to_string();
@@ -172,11 +171,11 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
             let loc = lines[j].trim();
             if let Some(rest) = loc.strip_prefix("--> ") {
                 let p: Vec<&str> = rest.splitn(3, ':').collect();
-                if p.len() >= 2 {
-                    if let Ok(row) = p[1].parse::<usize>() {
-                        let col = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                        location = Some((p[0].to_string(), row, col));
-                    }
+                if p.len() >= 2
+                    && let Ok(row) = p[1].parse::<usize>()
+                {
+                    let col = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+                    location = Some((p[0].to_string(), row, col));
                 }
                 break;
             }
@@ -242,23 +241,45 @@ fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
     diags
 }
 
+// ── file context snippet ──────────────────────────────────────────────────────
+
+fn make_diff(path: &str, before: &str, after: &str) -> String {
+    use similar::TextDiff;
+    let diff = TextDiff::from_lines(before, after);
+    let result = diff
+        .unified_diff()
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    if result.is_empty() {
+        "(no changes)".to_string()
+    } else {
+        result
+    }
+}
+
+// ── run executable ────────────────────────────────────────────────────────────
+
+fn run_executable(path: &str) -> Value {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    run_bash(path, DEFAULT_TIMEOUT_MS)
+}
+
 // ── autocheck ─────────────────────────────────────────────────────────────────
 
-fn auto_check(path: &str) -> Value {
-    let p = Path::new(path);
-    let needs_check = p.extension().map_or(false, |e| e == "rs")
-        || p.file_name().map_or(false, |n| n == "Cargo.toml");
-    if !needs_check {
-        return json!({ "success": null, "summary": "skipped: not a .rs or Cargo.toml file" });
-    }
-    let Some(root) = find_cargo_root(p) else {
-        return json!({ "success": null, "summary": format!("skipped: no Cargo.toml above {path}") });
-    };
+fn run_check_in_root(root: &Path) -> Value {
     let path_env = cargo_path_env();
 
     let fix = Command::new("cargo")
         .args(["clippy", "--fix", "--allow-dirty"])
-        .current_dir(&root)
+        .current_dir(root)
         .env("PATH", &path_env)
         .output();
     let (clippy_ok, _clippy_stderr) = match fix {
@@ -271,7 +292,7 @@ fn auto_check(path: &str) -> Value {
 
     let check = Command::new("cargo")
         .args(["check", "--message-format=human"])
-        .current_dir(&root)
+        .current_dir(root)
         .env("PATH", &path_env)
         .output();
     let (check_ok, check_stderr) = match check {
@@ -282,7 +303,7 @@ fn auto_check(path: &str) -> Value {
         Err(e) => (false, format!("spawn failed: {e}")),
     };
 
-    let diags = parse_diagnostics(&check_stderr, &root);
+    let diags = parse_diagnostics(&check_stderr, root);
     let errors: Vec<&Value> = diags.iter().filter(|d| d["level"] == "error").collect();
     let warnings: Vec<&Value> = diags.iter().filter(|d| d["level"] == "warning").collect();
 
@@ -299,12 +320,172 @@ fn auto_check(path: &str) -> Value {
     })
 }
 
+fn auto_check(path: &str) -> Value {
+    let p = Path::new(path);
+    let needs_check = p.extension().is_some_and(|e| e == "rs")
+        || p.file_name().is_some_and(|n| n == "Cargo.toml");
+    if !needs_check {
+        return json!({ "success": null, "summary": "skipped: not a .rs or Cargo.toml file" });
+    }
+    let Some(root) = find_cargo_root(p) else {
+        return json!({ "success": null, "summary": format!("skipped: no Cargo.toml above {path}") });
+    };
+    run_check_in_root(&root)
+}
+
 // ── tools ─────────────────────────────────────────────────────────────────────
+
+/// 실제 파일 쓰기 로직 (autocheck 없이). write/multiwrite 양쪽에서 호출.
+fn do_write(
+    path: &str,
+    new_content: String,
+    old_string: Option<String>,
+    count: Option<usize>,
+    append: Option<bool>,
+    shebang: Option<String>,
+) -> Value {
+    // ── shebang ───────────────────────────────────────────────────────────────
+    let new_content = if let Some(ref shebang) = shebang {
+        let line = if shebang.starts_with("#!") {
+            shebang.clone()
+        } else {
+            format!("#!{shebang}")
+        };
+        format!("{line}\n{new_content}")
+    } else {
+        new_content
+    };
+
+    // ── append mode ───────────────────────────────────────────────────────────
+    if append.unwrap_or(false) {
+        if let Some(ref anchor) = old_string {
+            let original = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => return json!({ "error": format!("read failed: {e}") }),
+            };
+            if !original.contains(anchor.as_str()) {
+                return json!({ "error": "old_string not found" });
+            }
+            let updated = original.replacen(anchor.as_str(), &format!("{anchor}{new_content}"), 1);
+            if let Err(e) = std::fs::write(path, &updated) {
+                return json!({ "error": format!("write failed: {e}") });
+            }
+            let diff = make_diff(path, &original, &updated);
+            let run = shebang.as_ref().map(|_| run_executable(path));
+            return json!({ "inserted_after": path, "bytes": new_content.len(), "diff": diff, "run": run });
+        }
+        use std::fs::OpenOptions;
+        let before = std::fs::read_to_string(path).unwrap_or_default();
+        match OpenOptions::new().create(true).append(true).open(path) {
+            Err(e) => return json!({ "error": format!("open failed: {e}") }),
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(new_content.as_bytes()) {
+                    return json!({ "error": format!("write failed: {e}") });
+                }
+            }
+        }
+        let after = std::fs::read_to_string(path).unwrap_or_default();
+        let diff = make_diff(path, &before, &after);
+        let run = shebang.as_ref().map(|_| run_executable(path));
+        return json!({ "appended": path, "bytes": new_content.len(), "diff": diff, "run": run });
+    }
+
+    // ── replace mode ──────────────────────────────────────────────────────────
+    if let Some(old) = old_string {
+        let original = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => return json!({ "error": format!("read failed: {e}") }),
+        };
+        let found = original.matches(old.as_str()).count();
+        if found == 0 {
+            return json!({ "error": "old_string not found" });
+        }
+        let expected = count.unwrap_or(1);
+        if expected != 0 && found != expected {
+            return json!({ "error": format!("expected {expected} occurrence(s) but found {found}") });
+        }
+        let updated = if expected == 0 {
+            original.replace(old.as_str(), &new_content)
+        } else {
+            let mut s = original.clone();
+            for _ in 0..expected {
+                s = s.replacen(old.as_str(), &new_content, 1);
+            }
+            s
+        };
+        if let Err(e) = std::fs::write(path, &updated) {
+            return json!({ "error": format!("write failed: {e}") });
+        }
+        let diff = make_diff(path, &original, &updated);
+        let run = shebang.as_ref().map(|_| run_executable(path));
+        return json!({ "replaced": path, "occurrences": found, "diff": diff, "run": run });
+    }
+
+    // ── overwrite mode ────────────────────────────────────────────────────────
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return json!({ "error": format!("mkdir failed: {e}") });
+    }
+    let before = std::fs::read_to_string(path).unwrap_or_default();
+    if let Err(e) = std::fs::write(path, &new_content) {
+        return json!({ "error": format!("write failed: {e}") });
+    }
+    let diff = make_diff(path, &before, &new_content);
+    let run = shebang.as_ref().map(|_| run_executable(path));
+    json!({ "written": path, "bytes": new_content.len(), "diff": diff, "run": run })
+}
 
 struct Tools;
 
 #[tool]
 impl ds_api::Tool for Tools {
+    /// Write multiple files in one call, then run cargo check once at the end.
+    /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
+    ///   path (required), new_content (required), old_string, count, append, shebang
+    async fn multiwrite(&self, writes_json: String) -> Value {
+        let arr: Vec<Value> = match serde_json::from_str(&writes_json) {
+            Ok(Value::Array(a)) => a,
+            _ => return json!({ "error": "writes_json must be a JSON array" }),
+        };
+
+        let mut results = Vec::new();
+        let mut cargo_root: Option<PathBuf> = None;
+
+        for item in &arr {
+            let path = match item["path"].as_str() {
+                Some(p) => p.to_string(),
+                None => {
+                    results.push(json!({ "error": "missing path" }));
+                    continue;
+                }
+            };
+            let new_content = item["new_content"].as_str().unwrap_or("").to_string();
+            let old_string = item["old_string"].as_str().map(str::to_string);
+            let count = item["count"].as_u64().map(|n| n as usize);
+            let append = item["append"].as_bool();
+            let shebang = item["shebang"].as_str().map(str::to_string);
+
+            // 找 cargo root（取第一个 .rs 文件的）
+            if cargo_root.is_none() {
+                cargo_root = find_cargo_root(Path::new(&path));
+            }
+
+            // 执行写操作（跳过 autocheck，自己做）
+            let write_result = do_write(&path, new_content, old_string, count, append, shebang);
+            results.push(write_result);
+        }
+
+        // 统一跑一次 cargo check
+        let autocheck = match cargo_root {
+            Some(root) => run_check_in_root(&root),
+            None => json!({ "success": null, "summary": "skipped: no Cargo.toml found" }),
+        };
+
+        json!({ "results": results, "autocheck": autocheck })
+    }
+
     /// Execute a shell command and return combined stdout+stderr (truncated to 8000 chars).
     /// command: the shell command to run
     /// timeout_ms: max milliseconds to wait (default 10000)
@@ -315,15 +496,17 @@ impl ds_api::Tool for Tools {
     /// Write to a file (overwrite / replace / append), then run cargo clippy --fix + cargo check.
     ///
     /// Modes:
-    ///   - old_string omitted → overwrite entire file with new_content (or create)
-    ///   - old_string present → replace occurrences of old_string with new_content
-    ///   - append = true      → append new_content to end of file (old_string ignored)
+    ///   - old_string omitted, append omitted → overwrite entire file with new_content (or create)
+    ///   - old_string present, append omitted → replace occurrences of old_string with new_content
+    ///   - append = true, old_string omitted  → append new_content to end of file
+    ///   - append = true, old_string present  → insert new_content immediately after old_string
     ///
     /// path: absolute path to the file
-    /// new_content: content to write or replacement text
-    /// old_string: exact text to find and replace (omit to overwrite)
-    /// count: expected number of replacements when using old_string (default 1, 0 = replace all)
-    /// append: if true, append new_content to the file instead
+    /// new_content: content to write, replacement text, or text to insert
+    /// old_string: exact text to find and replace (or anchor for insert-after)
+    /// count: expected number of replacements when using old_string in replace mode (default 1, 0 = replace all)
+    /// append: if true, append to end of file or insert after old_string
+    /// shebang: if provided, prepend this shebang line and execute the file after writing
     async fn write(
         &self,
         path: String,
@@ -331,64 +514,11 @@ impl ds_api::Tool for Tools {
         old_string: Option<String>,
         count: Option<usize>,
         append: Option<bool>,
+        shebang: Option<String>,
     ) -> Value {
-        // ── append mode ───────────────────────────────────────────────────────
-        if append.unwrap_or(false) {
-            use std::fs::OpenOptions;
-            match OpenOptions::new().create(true).append(true).open(&path) {
-                Err(e) => return json!({ "error": format!("open failed: {e}") }),
-                Ok(mut f) => {
-                    if let Err(e) = f.write_all(new_content.as_bytes()) {
-                        return json!({ "error": format!("write failed: {e}") });
-                    }
-                }
-            }
-            return json!({ "appended": path, "bytes": new_content.len(), "autocheck": auto_check(&path) });
-        }
-
-        // ── replace mode ──────────────────────────────────────────────────────
-        if let Some(old) = old_string {
-            let original = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => return json!({ "error": format!("read failed: {e}") }),
-            };
-            let found = original.matches(old.as_str()).count();
-            if found == 0 {
-                return json!({ "error": "old_string not found" });
-            }
-            let expected = count.unwrap_or(1);
-            if expected != 0 && found != expected {
-                return json!({
-                    "error": format!("expected {expected} occurrence(s) but found {found}")
-                });
-            }
-            let updated = if expected == 0 {
-                original.replace(old.as_str(), &new_content)
-            } else {
-                let mut s = original.clone();
-                for _ in 0..expected {
-                    s = s.replacen(old.as_str(), &new_content, 1);
-                }
-                s
-            };
-            if let Err(e) = std::fs::write(&path, &updated) {
-                return json!({ "error": format!("write failed: {e}") });
-            }
-            return json!({ "replaced": path, "occurrences": found, "autocheck": auto_check(&path) });
-        }
-
-        // ── overwrite mode ────────────────────────────────────────────────────
-        if let Some(parent) = Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return json!({ "error": format!("mkdir failed: {e}") });
-                }
-            }
-        }
-        if let Err(e) = std::fs::write(&path, &new_content) {
-            return json!({ "error": format!("write failed: {e}") });
-        }
-        json!({ "written": path, "bytes": new_content.len(), "autocheck": auto_check(&path) })
+        let mut result = do_write(&path, new_content, old_string, count, append, shebang);
+        result["autocheck"] = auto_check(&path);
+        result
     }
 }
 
