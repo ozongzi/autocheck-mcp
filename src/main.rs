@@ -1,246 +1,11 @@
 use ds_api::{McpServer, ToolBundle, tool};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::process::Command;
 
-// ── constants ─────────────────────────────────────────────────────────────────
-
-const DEFAULT_TIMEOUT_MS: u64 = 10_000;
-const OUTPUT_LIMIT: usize = 8_000;
-
-// ── cargo root ────────────────────────────────────────────────────────────────
-
-fn find_cargo_root(start: &Path) -> Option<PathBuf> {
-    let mut cur = if start.is_file() {
-        start.parent()?.to_path_buf()
-    } else {
-        start.to_path_buf()
-    };
-    loop {
-        if cur.join("Cargo.toml").exists() {
-            return Some(cur);
-        }
-        if !cur.pop() {
-            return None;
-        }
-    }
-}
-
-// ── PATH helper ───────────────────────────────────────────────────────────────
-
-fn cargo_path_env() -> String {
-    #[cfg(windows)]
-    let (home_var, cargo_suffix, sep) = ("USERPROFILE", r".cargo\bin", ";");
-    #[cfg(not(windows))]
-    let (home_var, cargo_suffix, sep) = ("HOME", ".cargo/bin", ":");
-
-    #[cfg(windows)]
-    let path_var = "Path";
-    #[cfg(not(windows))]
-    let path_var = "PATH";
-
-    let current = std::env::var(path_var)
-        .or_else(|_| std::env::var("PATH"))
-        .unwrap_or_default();
-    let cargo_bin = std::env::var(home_var)
-        .map(|h| format!("{h}{}{cargo_suffix}", std::path::MAIN_SEPARATOR))
-        .unwrap_or_default();
-    if cargo_bin.is_empty() || current.contains(&cargo_bin) {
-        current
-    } else {
-        format!("{cargo_bin}{sep}{current}")
-    }
-}
-
-// ── output truncation ─────────────────────────────────────────────────────────
-
-fn truncate_output(s: String) -> Value {
-    let total = s.len();
-    if total <= OUTPUT_LIMIT {
-        return json!({ "output": s, "truncated": false });
-    }
-    // 截断到 char boundary
-    let mut cut = OUTPUT_LIMIT;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    json!({
-        "output": &s[..cut],
-        "truncated": true,
-        "total_bytes": total,
-        "shown_bytes": cut,
-    })
-}
-
-// ── bash execution ────────────────────────────────────────────────────────────
-
-async fn run_bash(command: &str, timeout_ms: u64) -> Value {
-    use tokio::io::AsyncReadExt;
-    use tokio::time::{Duration, sleep};
-
-    #[cfg(windows)]
-    let (prog, args) = ("cmd", vec!["/C", command]);
-    #[cfg(not(windows))]
-    let (prog, args) = ("sh", vec!["-c", command]);
-
-    let path_env = cargo_path_env();
-
-    let mut child = match Command::new(prog)
-        .args(&args)
-        .env("PATH", &path_env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return json!({ "error": format!("spawn failed: {e}") }),
-    };
-
-    let mut stdout = child.stdout.take().expect("piped");
-    let mut stderr = child.stderr.take().expect("piped");
-
-    let read_all = async {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        tokio::join!(
-            async {
-                let _ = stdout.read_to_end(&mut out).await;
-            },
-            async {
-                let _ = stderr.read_to_end(&mut err).await;
-            },
-        );
-        (out, err)
-    };
-
-    tokio::select! {
-        (stdout_bytes, stderr_bytes) = read_all => {
-            let exit_code = child.wait().await.ok().and_then(|s| s.code());
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&stdout_bytes),
-                String::from_utf8_lossy(&stderr_bytes),
-            );
-            let mut r = truncate_output(combined);
-            r["exit_code"] = json!(exit_code);
-            r["timed_out"] = json!(false);
-            r
-        }
-        _ = sleep(Duration::from_millis(timeout_ms)) => {
-            let _ = child.kill().await;
-            json!({
-                "error": format!("timed out after {timeout_ms}ms"),
-                "timed_out": true,
-            })
-        }
-    }
-}
-
-// ── diagnostic parsing ────────────────────────────────────────────────────────
-
-fn parse_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
-    let mut diags: Vec<Value> = Vec::new();
-    let lines: Vec<&str> = stderr.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let level = if line.starts_with("error") {
-            "error"
-        } else if line.starts_with("warning") {
-            "warning"
-        } else {
-            i += 1;
-            continue;
-        };
-        if line.contains("aborting due to") || line.contains("could not compile") {
-            i += 1;
-            continue;
-        }
-        let message = line
-            .split_once(": ")
-            .map(|x| x.1)
-            .unwrap_or(line)
-            .trim()
-            .to_string();
-
-        // 找 --> 位置行
-        let mut location: Option<(String, usize, usize)> = None;
-        let mut j = i + 1;
-        while j < lines.len() && j < i + 6 {
-            let loc = lines[j].trim();
-            if let Some(rest) = loc.strip_prefix("--> ") {
-                let p: Vec<&str> = rest.splitn(3, ':').collect();
-                if p.len() >= 2
-                    && let Ok(row) = p[1].parse::<usize>()
-                {
-                    let col = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                    location = Some((p[0].to_string(), row, col));
-                }
-                break;
-            }
-            if lines[j].starts_with("error") || lines[j].starts_with("warning") {
-                break;
-            }
-            j += 1;
-        }
-
-        // 收集原始诊断块
-        let mut raw_lines = vec![line];
-        let mut k = i + 1;
-        while k < lines.len() {
-            let next = lines[k];
-            let is_new = !next.starts_with(' ')
-                && !next.starts_with('\t')
-                && (next.starts_with("error") || next.starts_with("warning"))
-                && !next.trim().is_empty();
-            if is_new {
-                break;
-            }
-            raw_lines.push(next);
-            k += 1;
-        }
-
-        // 读源码上下文
-        let source_context = location.as_ref().and_then(|(rel, row, _)| {
-            let abs = if Path::new(rel).is_absolute() {
-                PathBuf::from(rel)
-            } else {
-                crate_root.join(rel)
-            };
-            let src = std::fs::read_to_string(&abs).ok()?;
-            let src_lines: Vec<&str> = src.lines().collect();
-            let total = src_lines.len();
-            let center = row.saturating_sub(1);
-            let start = center.saturating_sub(5);
-            let end = (center + 6).min(total);
-            let snippet: Vec<String> = src_lines[start..end]
-                .iter()
-                .enumerate()
-                .map(|(idx, l)| {
-                    let lineno = start + idx + 1;
-                    let marker = if lineno == *row { ">>>" } else { "   " };
-                    format!("{marker} {lineno:4} | {l}")
-                })
-                .collect();
-            Some(json!({ "file": rel, "line": row, "snippet": snippet.join("\n") }))
-        });
-
-        let mut diag = json!({ "level": level, "message": message, "raw": raw_lines.join("\n") });
-        if let Some((f, r, c)) = &location {
-            diag["file"] = json!(f);
-            diag["line"] = json!(r);
-            diag["col"] = json!(c);
-        }
-        if let Some(ctx) = source_context {
-            diag["source_context"] = ctx;
-        }
-        diags.push(diag);
-        i = k;
-    }
-    diags
-}
+use autocheck_mcp::utils::{run_bash, find_root, DEFAULT_TIMEOUT_MS};
+use autocheck_mcp::languages::{detect_language, get_support, Language};
 
 // ── file context snippet ──────────────────────────────────────────────────────
 
@@ -275,71 +40,20 @@ async fn run_executable(path: &str) -> Value {
 
 // ── autocheck ─────────────────────────────────────────────────────────────────
 
-async fn run_check_in_root(root: &Path) -> Value {
-    let path_env = cargo_path_env();
-
-    let fix = Command::new("cargo")
-        .args(["clippy", "--fix", "--allow-dirty"])
-        .current_dir(root)
-        .env("PATH", &path_env)
-        .output()
-        .await;
-    let (clippy_ok, _clippy_stderr) = match fix {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stderr).to_string(),
-        ),
-        Err(e) => (false, format!("spawn failed: {e}")),
-    };
-
-    let check = Command::new("cargo")
-        .args(["clippy", "--message-format=human"])
-        .current_dir(root)
-        .env("PATH", &path_env)
-        .output()
-        .await;
-
-    let (check_ok, check_stderr) = match check {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stderr).to_string(),
-        ),
-        Err(e) => (false, format!("spawn failed: {e}")),
-    };
-
-    let diags = parse_diagnostics(&check_stderr, root);
-    let errors: Vec<&Value> = diags.iter().filter(|d| d["level"] == "error").collect();
-    let warnings: Vec<&Value> = diags.iter().filter(|d| d["level"] == "warning").collect();
-
-    json!({
-        "success": check_ok,
-        "clippy_fix_ok": clippy_ok,
-        "summary": if check_ok {
-            format!("✅ cargo check passed ({} warning(s))", warnings.len())
-        } else {
-            format!("❌ cargo check failed: {} error(s), {} warning(s)", errors.len(), warnings.len())
-        },
-        "errors": errors,
-        "warnings": warnings,
-    })
-}
-
 async fn auto_check(path: &str) -> Value {
     let p = Path::new(path);
-    let needs_check = p.extension().is_some_and(|e| e == "rs")
-        || p.file_name().is_some_and(|n| n == "Cargo.toml");
-    if !needs_check {
-        return json!({ "success": null, "summary": "skipped: not a .rs or Cargo.toml file" });
-    }
-    let Some(root) = find_cargo_root(p) else {
-        return json!({ "success": null, "summary": format!("skipped: no Cargo.toml above {path}") });
+    let Some(lang) = detect_language(p) else {
+        return json!({ "success": null, "summary": format!("skipped: unsupported file type for {path}") });
     };
-    run_check_in_root(&root).await
+    let support = get_support(lang);
+    let Some(root) = find_root(p, support.root_markers()) else {
+        return json!({ "success": null, "summary": format!("skipped: no root markers found above {path}") });
+    };
+    support.run_check(&root, Some(p)).await.to_json()
 }
 
-// ── tools ─────────────────────────────────────────────────────────────────────
+// ── tools implementation ──────────────────────────────────────────────────────
 
-/// 실제 파일 쓰기 로직 (autocheck 없이). write/multiwrite 양쪽에서 호출.
 async fn do_write(
     path: &str,
     new_content: String,
@@ -348,7 +62,6 @@ async fn do_write(
     append: Option<bool>,
     shebang: Option<String>,
 ) -> Value {
-    // ── shebang ───────────────────────────────────────────────────────────────
     let new_content = if let Some(ref shebang) = shebang {
         let line = if shebang.starts_with("#!") {
             shebang.clone()
@@ -360,7 +73,6 @@ async fn do_write(
         new_content
     };
 
-    // ── append mode ───────────────────────────────────────────────────────────
     if append.unwrap_or(false) {
         if let Some(ref anchor) = old_string {
             let original = match std::fs::read_to_string(path) {
@@ -402,7 +114,6 @@ async fn do_write(
         return json!({ "appended": path, "bytes": new_content.len(), "diff": diff, "run": run });
     }
 
-    // ── replace mode ──────────────────────────────────────────────────────────
     if let Some(old) = old_string {
         let original = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -437,7 +148,6 @@ async fn do_write(
         return json!({ "replaced": path, "occurrences": found, "diff": diff, "run": run });
     }
 
-    // ── overwrite mode ────────────────────────────────────────────────────────
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -461,7 +171,7 @@ struct Tools;
 
 #[tool]
 impl ds_api::Tool for Tools {
-    /// Write multiple files in one call, then run cargo check once at the end.
+    /// Write multiple files in one call, then run checks (autocheck) for all affected projects once at the end.
     /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
     ///   path (required), new_content (required), old_string, count, append, shebang
     async fn multiwrite(&self, writes_json: String) -> Value {
@@ -471,7 +181,7 @@ impl ds_api::Tool for Tools {
         };
 
         let mut results = Vec::new();
-        let mut cargo_root: Option<PathBuf> = None;
+        let mut affected: HashSet<(PathBuf, Language)> = HashSet::new();
 
         for item in &arr {
             let path = match item["path"].as_str() {
@@ -487,34 +197,33 @@ impl ds_api::Tool for Tools {
             let append = item["append"].as_bool();
             let shebang = item["shebang"].as_str().map(str::to_string);
 
-            // 找 cargo root（取第一个 .rs 文件的）
-            if cargo_root.is_none() {
-                cargo_root = find_cargo_root(Path::new(&path));
-            }
-
-            // 执行写操作（跳过 autocheck，自己做）
             let write_result =
                 do_write(&path, new_content, old_string, count, append, shebang).await;
             results.push(write_result);
+
+            let p = Path::new(&path);
+            if let Some(lang) = detect_language(p) {
+                let support = get_support(lang);
+                if let Some(root) = find_root(p, support.root_markers()) {
+                    affected.insert((root, lang));
+                }
+            }
         }
 
-        // 统一跑一次 cargo check
-        let autocheck = match cargo_root {
-            Some(root) => run_check_in_root(&root).await,
-            None => json!({ "success": null, "summary": "skipped: no Cargo.toml found" }),
-        };
+        let mut autochecks = Vec::new();
+        for (root, lang) in affected {
+            let support = get_support(lang);
+            autochecks.push(support.run_check(&root, None).await.to_json());
+        }
 
-        json!({ "results": results, "autocheck": autocheck })
+        json!({ "results": results, "autochecks": autochecks })
     }
 
-    /// Execute a shell command and return combined stdout+stderr (truncated to 8000 chars).
-    /// command: the shell command to run
-    /// timeout_ms: max milliseconds to wait (default 10000)
     async fn bash(&self, command: String, timeout_ms: Option<u64>) -> Value {
         run_bash(&command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)).await
     }
 
-    /// Write to a file (overwrite / replace / append), then run cargo clippy --fix + cargo check.
+    /// Write to a file (overwrite / replace / append), then run language-specific check (autocheck).
     ///
     /// Modes:
     ///   - old_string omitted, append omitted → overwrite entire file with new_content (or create)
@@ -542,8 +251,6 @@ impl ds_api::Tool for Tools {
         result
     }
 }
-
-// ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
