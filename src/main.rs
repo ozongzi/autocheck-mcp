@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use autocheck_mcp::utils::{run_bash, find_root, DEFAULT_TIMEOUT_MS};
-use autocheck_mcp::languages::{detect_language, get_support, Language};
+use autocheck_mcp::languages::{Language, detect_language, get_support};
+use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, find_root, run_bash};
 
 // ── file context snippet ──────────────────────────────────────────────────────
 
@@ -224,6 +224,7 @@ impl ds_api::Tool for Tools {
     }
 
     /// Write to a file (overwrite / replace / append), then run language-specific check (autocheck).
+    /// Can also used for normal text manipulation tasks, not necessarily code files.
     ///
     /// Modes:
     ///   - old_string omitted, append omitted → overwrite entire file with new_content (or create)
