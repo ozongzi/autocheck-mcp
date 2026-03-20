@@ -33,12 +33,11 @@ pub fn parse_rust_diagnostics(stderr: &str, crate_root: &Path) -> Vec<Value> {
             let loc = lines[j].trim();
             if let Some(rest) = loc.strip_prefix("--> ") {
                 let p: Vec<&str> = rest.splitn(3, ':').collect();
-                if p.len() >= 2 {
-                    if let Ok(row) = p[1].parse::<usize>() {
+                if p.len() >= 2
+                    && let Ok(row) = p[1].parse::<usize>() {
                         let col = p.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
                         location = Some((p[0].to_string(), row, col));
                     }
-                }
                 break;
             }
             if lines[j].starts_with("error") || lines[j].starts_with("warning") {

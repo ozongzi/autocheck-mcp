@@ -5,9 +5,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use autocheck_mcp::languages::{Language, detect_language, get_support};
-use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, find_root, run_bash};
+use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash};
 
 // ── file context snippet ──────────────────────────────────────────────────────
+
+fn not_found_error(content: String) -> Value {
+    let total = content.len();
+    let mut cut = OUTPUT_LIMIT.min(total);
+    while !content.is_char_boundary(cut) { cut -= 1; }
+    json!({
+        "error": "old_string not found",
+        "file_content": &content[..cut],
+        "truncated": total > cut,
+        "total_bytes": total,
+    })
+}
 
 fn make_diff(path: &str, before: &str, after: &str) -> String {
     use similar::TextDiff;
@@ -80,7 +92,7 @@ async fn do_write(
                 Err(e) => return json!({ "error": format!("read failed: {e}") }),
             };
             if !original.contains(anchor.as_str()) {
-                return json!({ "error": "old_string not found" });
+                return not_found_error(original);
             }
             let updated = original.replacen(anchor.as_str(), &format!("{anchor}{new_content}"), 1);
             if let Err(e) = std::fs::write(path, &updated) {
@@ -121,7 +133,7 @@ async fn do_write(
         };
         let found = original.matches(old.as_str()).count();
         if found == 0 {
-            return json!({ "error": "old_string not found" });
+            return not_found_error(original);
         }
         let expected = count.unwrap_or(1);
         if expected != 0 && found != expected {
@@ -183,11 +195,14 @@ impl ds_api::Tool for Tools {
         let mut results = Vec::new();
         let mut affected: HashSet<(PathBuf, Language)> = HashSet::new();
 
+        let mut failures: Vec<String> = Vec::new();
+
         for item in &arr {
             let path = match item["path"].as_str() {
                 Some(p) => p.to_string(),
                 None => {
                     results.push(json!({ "error": "missing path" }));
+                    failures.push("<unknown>".to_string());
                     continue;
                 }
             };
@@ -199,7 +214,14 @@ impl ds_api::Tool for Tools {
 
             let write_result =
                 do_write(&path, new_content, old_string, count, append, shebang).await;
+
+            let failed = write_result.get("error").is_some();
             results.push(write_result);
+
+            if failed {
+                failures.push(path.clone());
+                continue; // don't add failed paths to autocheck
+            }
 
             let p = Path::new(&path);
             if let Some(lang) = detect_language(p) {
@@ -216,7 +238,7 @@ impl ds_api::Tool for Tools {
             autochecks.push(support.run_check(&root, None).await.to_json());
         }
 
-        json!({ "results": results, "autochecks": autochecks })
+        json!({ "results": results, "failed_paths": failures, "autochecks": autochecks })
     }
 
     async fn bash(&self, command: String, timeout_ms: Option<u64>) -> Value {
