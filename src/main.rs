@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use autocheck_mcp::languages::{CheckResult, Language, detect_language, get_support};
-use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash};
+use autocheck_mcp::utils::{BashOutput, DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash, run_bash_streaming};
 
 // ── file context snippet ──────────────────────────────────────────────────────
 
@@ -487,6 +487,40 @@ struct Tools;
 
 #[tool]
 impl agentix::Tool for Tools {
+    /// Read multiple files or directories in one call to reduce round-trips.
+    /// reads_json: JSON array of objects, each with the same fields as the `read` tool:
+    ///   path (required), start_line, end_line, search_regex, context_lines, outline_only, extract_symbol, max_depth
+    async fn multiread(&self, reads_json: String) -> Value {
+        let arr: Vec<Value> = match serde_json::from_str(&reads_json) {
+            Ok(Value::Array(a)) => a,
+            _ => return json!({ "error": "reads_json must be a JSON array" }),
+        };
+
+        let mut results = Vec::new();
+        for item in &arr {
+            let path = match item["path"].as_str() {
+                Some(p) => p.to_string(),
+                None => {
+                    results.push(json!({ "error": "missing path" }));
+                    continue;
+                }
+            };
+            let result = do_read(
+                &path,
+                item["start_line"].as_u64().map(|n| n as usize),
+                item["end_line"].as_u64().map(|n| n as usize),
+                item["search_regex"].as_str().map(str::to_string),
+                item["context_lines"].as_u64().map(|n| n as usize),
+                item["outline_only"].as_bool(),
+                item["extract_symbol"].as_str().map(str::to_string),
+                item["max_depth"].as_u64().map(|n| n as usize),
+            ).await;
+            results.push(result);
+        }
+
+        json!({ "results": results })
+    }
+
     /// Write multiple files in one call, then run checks (autocheck) for all affected projects once at the end.
     /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
     ///   path (required), new_string (required), old_string, count, append, shebang
@@ -545,8 +579,19 @@ impl agentix::Tool for Tools {
         json!({ "results": results, "failed_paths": failures, "autochecks": autochecks })
     }
 
-    async fn bash(&self, command: String, timeout_ms: Option<u64>) -> Value {
-        run_bash(&command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)).await
+    #[streaming]
+    fn bash(&self, command: String, timeout_ms: Option<u64>) {
+        async_stream::stream! {
+            use agentix::ToolOutput;
+            use futures::StreamExt;
+            let mut stream = run_bash_streaming(command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+            while let Some(item) = stream.next().await {
+                match item {
+                    BashOutput::Line(line) => yield ToolOutput::Progress(line),
+                    BashOutput::Done(result) => yield ToolOutput::Result(result),
+                }
+            }
+        }
     }
 
     /// Read, search, explore, or summarize files and directories.

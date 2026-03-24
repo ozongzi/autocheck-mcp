@@ -1,9 +1,16 @@
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
-pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+pub enum BashOutput {
+    Line(String),
+    Done(Value),
+}
+
+pub const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 pub const OUTPUT_LIMIT: usize = 8_000;
 
 pub fn find_root(start: &Path, markers: &[&str]) -> Option<PathBuf> {
@@ -65,6 +72,87 @@ pub fn truncate_output(s: String) -> Value {
     })
 }
 
+pub fn run_bash_streaming(command: String, timeout_ms: u64) -> BoxStream<'static, BashOutput> {
+    async_stream::stream! {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::Duration;
+
+        #[cfg(windows)]
+        let (prog, args) = ("cmd", vec!["/C".to_string(), command.clone()]);
+        #[cfg(not(windows))]
+        let (prog, args) = ("bash", vec!["-c".to_string(), command.clone()]);
+
+        let path_env = path_env_with_cargo();
+
+        let mut child = match Command::new(prog)
+            .args(&args)
+            .env("PATH", &path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                yield BashOutput::Done(json!({ "error": format!("spawn failed: {e}") }));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let mut stderr_lines = BufReader::new(stderr).lines();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut timed_out = false;
+        let mut output_buf = String::new();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                let _ = child.kill().await;
+                break;
+            }
+            tokio::select! {
+                line = stdout_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            output_buf.push_str(&l);
+                            output_buf.push('\n');
+                            yield BashOutput::Line(l);
+                        }
+                        _ => break,
+                    }
+                }
+                line = stderr_lines.next_line() => {
+                    if let Ok(Some(l)) = line {
+                        output_buf.push_str(&l);
+                        output_buf.push('\n');
+                        yield BashOutput::Line(format!("[stderr] {l}"));
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    timed_out = true;
+                    let _ = child.kill().await;
+                    break;
+                }
+            }
+        }
+
+        if timed_out {
+            yield BashOutput::Done(json!({ "error": format!("timed out after {timeout_ms}ms"), "timed_out": true }));
+            return;
+        }
+
+        let exit_code = child.wait().await.ok().and_then(|s| s.code());
+        let mut r = truncate_output(output_buf);
+        r["exit_code"] = json!(exit_code);
+        r["timed_out"] = json!(false);
+        yield BashOutput::Done(r);
+    }.boxed()
+}
+
 pub async fn run_bash(command: &str, timeout_ms: u64) -> Value {
     use tokio::io::AsyncReadExt;
     use tokio::time::{Duration, sleep};
@@ -72,7 +160,7 @@ pub async fn run_bash(command: &str, timeout_ms: u64) -> Value {
     #[cfg(windows)]
     let (prog, args) = ("cmd", vec!["/C", command]);
     #[cfg(not(windows))]
-    let (prog, args) = ("sh", vec!["-c", command]);
+    let (prog, args) = ("bash", vec!["-c", command]);
 
     let path_env = path_env_with_cargo();
 

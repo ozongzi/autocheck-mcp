@@ -107,7 +107,9 @@ name = "autocheck-mcp"
 version = "0.1.0"
 dependencies = [
  "agentix",
+ "async-stream",
  "async-trait",
+ "futures",
  "regex",
  "serde",
  "serde_json",
