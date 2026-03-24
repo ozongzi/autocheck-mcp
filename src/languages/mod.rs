@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
 use std::path::Path;
 
 pub mod rust;
@@ -15,7 +16,7 @@ pub enum Language {
     JavaScript,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct CheckResult {
     pub success: bool,
     pub fix_ok: bool,
@@ -26,13 +27,7 @@ pub struct CheckResult {
 
 impl CheckResult {
     pub fn to_json(&self) -> Value {
-        json!({
-            "success": self.success,
-            "fix_ok": self.fix_ok,
-            "summary": self.summary,
-            "errors": self.errors,
-            "warnings": self.warnings,
-        })
+        serde_json::to_value(self).unwrap()
     }
 }
 

@@ -1,11 +1,11 @@
-use ds_api::{McpServer, ToolBundle, tool};
+use agentix::{McpServer, tool};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use autocheck_mcp::languages::{Language, detect_language, get_support};
+use autocheck_mcp::languages::{CheckResult, Language, detect_language, get_support};
 use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash};
 
 // ── file context snippet ──────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ fn build_tree(dir: &Path, prefix: &str, depth: usize, max_depth: usize) -> Strin
     };
 
     let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     let total = entries.len();
     let show_count = total.min(MAX_DIR_ITEMS);
@@ -344,16 +344,12 @@ async fn run_executable(path: &str) -> Value {
 
 // ── autocheck ─────────────────────────────────────────────────────────────────
 
-async fn auto_check(path: &str) -> Value {
+async fn auto_check(path: &str) -> Option<CheckResult> {
     let p = Path::new(path);
-    let Some(lang) = detect_language(p) else {
-        return json!({ "success": null, "summary": format!("skipped: unsupported file type for {path}") });
-    };
+    let lang = detect_language(p)?;
     let support = get_support(lang);
-    let Some(root) = find_root(p, support.root_markers()) else {
-        return json!({ "success": null, "summary": format!("skipped: no root markers found above {path}") });
-    };
-    support.run_check(&root, Some(p)).await.to_json()
+    let root = find_root(p, support.root_markers())?;
+    Some(support.run_check(&root, Some(p)).await)
 }
 
 // ── tools implementation ──────────────────────────────────────────────────────
@@ -396,7 +392,11 @@ async fn do_write(
             } else {
                 None
             };
-            return json!({ "inserted_after": path, "bytes": new_string.len(), "diff": diff, "run": run });
+            let mut r = json!({ "inserted_after": path, "bytes": new_string.len(), "diff": diff });
+            if let Some(run) = run {
+                r["run"] = run;
+            }
+            return r;
         }
         use std::fs::OpenOptions;
         let before = std::fs::read_to_string(path).unwrap_or_default();
@@ -415,7 +415,11 @@ async fn do_write(
         } else {
             None
         };
-        return json!({ "appended": path, "bytes": new_string.len(), "diff": diff, "run": run });
+        let mut r = json!({ "appended": path, "bytes": new_string.len(), "diff": diff });
+        if let Some(run) = run {
+            r["run"] = run;
+        }
+        return r;
     }
 
     if let Some(old) = old_string {
@@ -449,7 +453,11 @@ async fn do_write(
         } else {
             None
         };
-        return json!({ "replaced": path, "occurrences": found, "diff": diff, "run": run });
+        let mut r = json!({ "replaced": path, "occurrences": found, "diff": diff });
+        if let Some(run) = run {
+            r["run"] = run;
+        }
+        return r;
     }
 
     if let Some(parent) = Path::new(path).parent()
@@ -468,13 +476,17 @@ async fn do_write(
     } else {
         None
     };
-    json!({ "written": path, "bytes": new_string.len(), "diff": diff, "run": run })
+    let mut r = json!({ "written": path, "bytes": new_string.len(), "diff": diff });
+    if let Some(run) = run {
+        r["run"] = run;
+    }
+    r
 }
 
 struct Tools;
 
 #[tool]
-impl ds_api::Tool for Tools {
+impl agentix::Tool for Tools {
     /// Write multiple files in one call, then run checks (autocheck) for all affected projects once at the end.
     /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
     ///   path (required), new_string (required), old_string, count, append, shebang
@@ -606,14 +618,16 @@ impl ds_api::Tool for Tools {
         shebang: Option<String>,
     ) -> Value {
         let mut result = do_write(&path, new_string, old_string, count, append, shebang).await;
-        result["autocheck"] = auto_check(&path).await;
+        if let Some(ac) = auto_check(&path).await {
+            result["autocheck"] = ac.to_json();
+        }
         result
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    McpServer::new(ToolBundle::new().add(Tools))
+    McpServer::new(Tools)
         .with_name("autocheck-mcp")
         .serve_stdio()
         .await?;
