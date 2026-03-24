@@ -1,9 +1,9 @@
+use crate::diagnostics::parse_rust_diagnostics;
+use crate::languages::{CheckResult, LanguageSupport};
+use crate::utils::path_env_with_cargo;
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::process::Command;
-use crate::languages::{LanguageSupport, CheckResult};
-use crate::utils::path_env_with_cargo;
-use crate::diagnostics::parse_rust_diagnostics;
 
 pub struct RustSupport;
 
@@ -42,16 +42,31 @@ impl LanguageSupport for RustSupport {
         };
 
         let diags = parse_rust_diagnostics(&check_stderr, root);
-        let errors: Vec<_> = diags.iter().filter(|d| d["level"] == "error").cloned().collect();
-        let warnings: Vec<_> = diags.iter().filter(|d| d["level"] == "warning").cloned().collect();
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d["level"] == "error")
+            .cloned()
+            .collect();
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d["level"] == "warning")
+            .cloned()
+            .collect();
 
         CheckResult {
             success: check_ok,
             fix_ok,
             summary: if check_ok {
-                format!("✅ cargo check passed ({} warning(s))", warnings.len())
+                format!(
+                    "✅ cargo clippy (include check) passed ({} warning(s))",
+                    warnings.len()
+                )
             } else {
-                format!("❌ cargo check failed: {} error(s), {} warning(s)", errors.len(), warnings.len())
+                format!(
+                    "❌ cargo clippy (include check) failed: {} error(s), {} warning(s)",
+                    errors.len(),
+                    warnings.len()
+                )
             },
             errors,
             warnings,

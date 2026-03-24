@@ -1,9 +1,9 @@
 use ds_api::{McpServer, ToolBundle, tool};
+use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use regex::Regex;
 
 use autocheck_mcp::languages::{Language, detect_language, get_support};
 use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash};
@@ -13,7 +13,9 @@ use autocheck_mcp::utils::{DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash
 fn not_found_error(content: String) -> Value {
     let total = content.len();
     let mut cut = OUTPUT_LIMIT.min(total);
-    while !content.is_char_boundary(cut) { cut -= 1; }
+    while !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
     json!({
         "error": "old_string not found",
         "file_content": &content[..cut],
@@ -70,7 +72,11 @@ fn build_tree(dir: &Path, prefix: &str, depth: usize, max_depth: usize) -> Strin
     }
 
     if total > MAX_DIR_ITEMS {
-        result.push_str(&format!("{}└── ... ({} more items)\n", prefix, total - MAX_DIR_ITEMS));
+        result.push_str(&format!(
+            "{}└── ... ({} more items)\n",
+            prefix,
+            total - MAX_DIR_ITEMS
+        ));
     }
 
     result
@@ -81,11 +87,11 @@ fn run_ctags(path: &Path) -> Option<String> {
         .args(["-f", "-", "--fields=n", "--sort=no", path.to_str()?])
         .output()
         .ok()?;
-    
+
     if !output.status.success() {
         return None;
     }
-    
+
     String::from_utf8(output.stdout).ok()
 }
 
@@ -96,8 +102,13 @@ fn parse_ctags_output(ctags_output: &str) -> Vec<(String, String, usize)> {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 3 {
                 let name = parts[0].to_string();
-                let kind = parts.get(3).and_then(|s| s.strip_prefix("kind:")).unwrap_or("?").to_string();
-                let line_num = parts.last()
+                let kind = parts
+                    .get(3)
+                    .and_then(|s| s.strip_prefix("kind:"))
+                    .unwrap_or("?")
+                    .to_string();
+                let line_num = parts
+                    .last()
                     .and_then(|s| s.strip_prefix("line:"))
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
@@ -112,25 +123,25 @@ fn parse_ctags_output(ctags_output: &str) -> Vec<(String, String, usize)> {
 fn extract_outline_ctags(path: &Path) -> Option<String> {
     let ctags_output = run_ctags(path)?;
     let tags = parse_ctags_output(&ctags_output);
-    
+
     let outline: Vec<String> = tags
         .into_iter()
         .map(|(name, kind, line)| format!("{:4} | [{}] {}", line, kind, name))
         .collect();
-    
+
     Some(outline.join("\n"))
 }
 
 fn extract_symbol_ctags(path: &Path, symbol: &str) -> Option<String> {
     let ctags_output = run_ctags(path)?;
     let tags = parse_ctags_output(&ctags_output);
-    
+
     let target = tags.iter().find(|(name, _, _)| name == symbol)?;
     let target_line = target.2;
-    
+
     let content = std::fs::read_to_string(path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
-    
+
     // Find the next tag's line number as the end boundary
     let end_line = tags
         .iter()
@@ -138,15 +149,17 @@ fn extract_symbol_ctags(path: &Path, symbol: &str) -> Option<String> {
         .map(|(_, _, line)| *line)
         .min()
         .unwrap_or(lines.len());
-    
-    let symbol_lines = lines.get(target_line - 1..end_line.saturating_sub(1))?
+
+    let symbol_lines = lines
+        .get(target_line - 1..end_line.saturating_sub(1))?
         .join("\n");
-    
+
     Some(symbol_lines)
 }
 
 fn add_line_numbers(content: &str, start_line: usize) -> String {
-    content.lines()
+    content
+        .lines()
         .enumerate()
         .map(|(i, line)| format!("{:4} | {}", start_line + i, line))
         .collect::<Vec<_>>()
@@ -347,21 +360,21 @@ async fn auto_check(path: &str) -> Value {
 
 async fn do_write(
     path: &str,
-    new_content: String,
+    new_string: String,
     old_string: Option<String>,
     count: Option<usize>,
     append: Option<bool>,
     shebang: Option<String>,
 ) -> Value {
-    let new_content = if let Some(ref shebang) = shebang {
+    let new_string = if let Some(ref shebang) = shebang {
         let line = if shebang.starts_with("#!") {
             shebang.clone()
         } else {
             format!("#!{shebang}")
         };
-        format!("{line}\n{new_content}")
+        format!("{line}\n{new_string}")
     } else {
-        new_content
+        new_string
     };
 
     if append.unwrap_or(false) {
@@ -373,7 +386,7 @@ async fn do_write(
             if !original.contains(anchor.as_str()) {
                 return not_found_error(original);
             }
-            let updated = original.replacen(anchor.as_str(), &format!("{anchor}{new_content}"), 1);
+            let updated = original.replacen(anchor.as_str(), &format!("{anchor}{new_string}"), 1);
             if let Err(e) = std::fs::write(path, &updated) {
                 return json!({ "error": format!("write failed: {e}") });
             }
@@ -383,14 +396,14 @@ async fn do_write(
             } else {
                 None
             };
-            return json!({ "inserted_after": path, "bytes": new_content.len(), "diff": diff, "run": run });
+            return json!({ "inserted_after": path, "bytes": new_string.len(), "diff": diff, "run": run });
         }
         use std::fs::OpenOptions;
         let before = std::fs::read_to_string(path).unwrap_or_default();
         match OpenOptions::new().create(true).append(true).open(path) {
             Err(e) => return json!({ "error": format!("open failed: {e}") }),
             Ok(mut f) => {
-                if let Err(e) = f.write_all(new_content.as_bytes()) {
+                if let Err(e) = f.write_all(new_string.as_bytes()) {
                     return json!({ "error": format!("write failed: {e}") });
                 }
             }
@@ -402,7 +415,7 @@ async fn do_write(
         } else {
             None
         };
-        return json!({ "appended": path, "bytes": new_content.len(), "diff": diff, "run": run });
+        return json!({ "appended": path, "bytes": new_string.len(), "diff": diff, "run": run });
     }
 
     if let Some(old) = old_string {
@@ -419,11 +432,11 @@ async fn do_write(
             return json!({ "error": format!("expected {expected} occurrence(s) but found {found}") });
         }
         let updated = if expected == 0 {
-            original.replace(old.as_str(), &new_content)
+            original.replace(old.as_str(), &new_string)
         } else {
             let mut s = original.clone();
             for _ in 0..expected {
-                s = s.replacen(old.as_str(), &new_content, 1);
+                s = s.replacen(old.as_str(), &new_string, 1);
             }
             s
         };
@@ -446,16 +459,16 @@ async fn do_write(
         return json!({ "error": format!("mkdir failed: {e}") });
     }
     let before = std::fs::read_to_string(path).unwrap_or_default();
-    if let Err(e) = std::fs::write(path, &new_content) {
+    if let Err(e) = std::fs::write(path, &new_string) {
         return json!({ "error": format!("write failed: {e}") });
     }
-    let diff = make_diff(path, &before, &new_content);
+    let diff = make_diff(path, &before, &new_string);
     let run = if shebang.is_some() {
         Some(run_executable(path).await)
     } else {
         None
     };
-    json!({ "written": path, "bytes": new_content.len(), "diff": diff, "run": run })
+    json!({ "written": path, "bytes": new_string.len(), "diff": diff, "run": run })
 }
 
 struct Tools;
@@ -464,7 +477,7 @@ struct Tools;
 impl ds_api::Tool for Tools {
     /// Write multiple files in one call, then run checks (autocheck) for all affected projects once at the end.
     /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
-    ///   path (required), new_content (required), old_string, count, append, shebang
+    ///   path (required), new_string (required), old_string, count, append, shebang
     async fn multiwrite(&self, writes_json: String) -> Value {
         let arr: Vec<Value> = match serde_json::from_str(&writes_json) {
             Ok(Value::Array(a)) => a,
@@ -485,14 +498,14 @@ impl ds_api::Tool for Tools {
                     continue;
                 }
             };
-            let new_content = item["new_content"].as_str().unwrap_or("").to_string();
+            let new_string = item["new_string"].as_str().unwrap_or("").to_string();
             let old_string = item["old_string"].as_str().map(str::to_string);
             let count = item["count"].as_u64().map(|n| n as usize);
             let append = item["append"].as_bool();
             let shebang = item["shebang"].as_str().map(str::to_string);
 
             let write_result =
-                do_write(&path, new_content, old_string, count, append, shebang).await;
+                do_write(&path, new_string, old_string, count, append, shebang).await;
 
             let failed = write_result.get("error").is_some();
             results.push(write_result);
@@ -555,20 +568,30 @@ impl ds_api::Tool for Tools {
         extract_symbol: Option<String>,
         max_depth: Option<usize>,
     ) -> Value {
-        do_read(&path, start_line, end_line, search_regex, context_lines, outline_only, extract_symbol, max_depth).await
+        do_read(
+            &path,
+            start_line,
+            end_line,
+            search_regex,
+            context_lines,
+            outline_only,
+            extract_symbol,
+            max_depth,
+        )
+        .await
     }
 
     /// Write to a file (overwrite / replace / append), then run language-specific check (autocheck).
     /// Can also used for normal text manipulation tasks, not necessarily code files.
     ///
     /// Modes:
-    ///   - old_string omitted, append omitted → overwrite entire file with new_content (or create)
-    ///   - old_string present, append omitted → replace occurrences of old_string with new_content
-    ///   - append = true, old_string omitted  → append new_content to end of file
-    ///   - append = true, old_string present  → insert new_content immediately after old_string
+    ///   - old_string omitted, append omitted → overwrite entire file with new_string (or create)
+    ///   - old_string present, append omitted → replace occurrences of old_string with new_string
+    ///   - append = true, old_string omitted  → append new_string to end of file
+    ///   - append = true, old_string present  → insert new_string immediately after old_string
     ///
     /// path: absolute path to the file
-    /// new_content: content to write, replacement text, or text to insert
+    /// new_string: content to write, replacement text, or text to insert
     /// old_string: exact text to find and replace (or anchor for insert-after)
     /// count: expected number of replacements when using old_string in replace mode (default 1, 0 = replace all)
     /// append: if true, append to end of file or insert after old_string
@@ -576,13 +599,13 @@ impl ds_api::Tool for Tools {
     async fn write(
         &self,
         path: String,
-        new_content: String,
+        new_string: String,
         old_string: Option<String>,
         count: Option<usize>,
         append: Option<bool>,
         shebang: Option<String>,
     ) -> Value {
-        let mut result = do_write(&path, new_content, old_string, count, append, shebang).await;
+        let mut result = do_write(&path, new_string, old_string, count, append, shebang).await;
         result["autocheck"] = auto_check(&path).await;
         result
     }

@@ -30,14 +30,14 @@ impl LanguageSupport for JavaScriptSupport {
 
         if eslint_check {
             fix_ok = Command::new("npx")
-                .args(["eslint", "--fix", "."])
+                .args(["--yes", "eslint", "--fix", "."])
                 .current_dir(root)
                 .status()
                 .await
                 .is_ok_and(|s| s.success());
 
             let check = Command::new("npx")
-                .args(["eslint", "."])
+                .args(["--yes", "eslint", "."])
                 .current_dir(root)
                 .output()
                 .await;
@@ -52,7 +52,7 @@ impl LanguageSupport for JavaScriptSupport {
         // Try npx tsc if tsconfig exists
         if root.join("tsconfig.json").exists() {
             let tsc = Command::new("npx")
-                .args(["tsc", "--noEmit"])
+                .args(["--yes", "tsc", "--noEmit"])
                 .current_dir(root)
                 .output()
                 .await;

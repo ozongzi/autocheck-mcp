@@ -1,7 +1,7 @@
 # autocheck-mcp
 
 MCP server with `bash` + `write` tools. After every `.rs` / `Cargo.toml` edit,
-runs `cargo clippy --fix` + `cargo check` and returns structured diagnostics with
+runs `cargo clippy --fix` + `cargo clippy (include check)` and returns structured diagnostics with
 source context.
 
 ## Docker usage (recommended)
@@ -83,4 +83,4 @@ Then in Claude Desktop:
 | Tool | Description |
 |---|---|
 | `bash(command, timeout_ms?)` | Run a shell command. stdout+stderr combined, truncated to 8000 chars. Default timeout 10s. |
-| `write(path, new_content, old_string?, count?, append?)` | Write/replace/append a file. Runs clippy+check for `.rs` and `Cargo.toml` files. |
+| `write(path, new_string, old_string?, count?, append?)` | Write/replace/append a file. Runs clippy+check for `.rs` and `Cargo.toml` files. |
