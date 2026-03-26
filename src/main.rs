@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use autocheck_mcp::languages::{CheckResult, Language, detect_language, get_support};
-use autocheck_mcp::utils::{BashOutput, DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash, run_bash_streaming};
+use autocheck_mcp::utils::{
+    BashOutput, DEFAULT_TIMEOUT_MS, OUTPUT_LIMIT, find_root, run_bash, run_bash_streaming,
+};
 
 // ── file context snippet ──────────────────────────────────────────────────────
 
@@ -313,20 +315,6 @@ async fn do_read(
     })
 }
 
-fn make_diff(path: &str, before: &str, after: &str) -> String {
-    use similar::TextDiff;
-    let diff = TextDiff::from_lines(before, after);
-    let result = diff
-        .unified_diff()
-        .header(&format!("a/{path}"), &format!("b/{path}"))
-        .to_string();
-    if result.is_empty() {
-        "(no changes)".to_string()
-    } else {
-        result
-    }
-}
-
 // ── run executable ────────────────────────────────────────────────────────────
 
 async fn run_executable(path: &str) -> Value {
@@ -386,20 +374,18 @@ async fn do_write(
             if let Err(e) = std::fs::write(path, &updated) {
                 return json!({ "error": format!("write failed: {e}") });
             }
-            let diff = make_diff(path, &original, &updated);
             let run = if shebang.is_some() {
                 Some(run_executable(path).await)
             } else {
                 None
             };
-            let mut r = json!({ "inserted_after": path, "bytes": new_string.len(), "diff": diff });
+            let mut r = json!({ "inserted_after": path, "bytes": new_string.len() });
             if let Some(run) = run {
                 r["run"] = run;
             }
             return r;
         }
         use std::fs::OpenOptions;
-        let before = std::fs::read_to_string(path).unwrap_or_default();
         match OpenOptions::new().create(true).append(true).open(path) {
             Err(e) => return json!({ "error": format!("open failed: {e}") }),
             Ok(mut f) => {
@@ -408,14 +394,12 @@ async fn do_write(
                 }
             }
         }
-        let after = std::fs::read_to_string(path).unwrap_or_default();
-        let diff = make_diff(path, &before, &after);
         let run = if shebang.is_some() {
             Some(run_executable(path).await)
         } else {
             None
         };
-        let mut r = json!({ "appended": path, "bytes": new_string.len(), "diff": diff });
+        let mut r = json!({ "appended": path, "bytes": new_string.len() });
         if let Some(run) = run {
             r["run"] = run;
         }
@@ -447,13 +431,12 @@ async fn do_write(
         if let Err(e) = std::fs::write(path, &updated) {
             return json!({ "error": format!("write failed: {e}") });
         }
-        let diff = make_diff(path, &original, &updated);
         let run = if shebang.is_some() {
             Some(run_executable(path).await)
         } else {
             None
         };
-        let mut r = json!({ "replaced": path, "occurrences": found, "diff": diff });
+        let mut r = json!({ "replaced": path, "occurrences": found });
         if let Some(run) = run {
             r["run"] = run;
         }
@@ -466,17 +449,15 @@ async fn do_write(
     {
         return json!({ "error": format!("mkdir failed: {e}") });
     }
-    let before = std::fs::read_to_string(path).unwrap_or_default();
     if let Err(e) = std::fs::write(path, &new_string) {
         return json!({ "error": format!("write failed: {e}") });
     }
-    let diff = make_diff(path, &before, &new_string);
     let run = if shebang.is_some() {
         Some(run_executable(path).await)
     } else {
         None
     };
-    let mut r = json!({ "written": path, "bytes": new_string.len(), "diff": diff });
+    let mut r = json!({ "written": path, "bytes": new_string.len() });
     if let Some(run) = run {
         r["run"] = run;
     }
@@ -514,7 +495,8 @@ impl agentix::Tool for Tools {
                 item["outline_only"].as_bool(),
                 item["extract_symbol"].as_str().map(str::to_string),
                 item["max_depth"].as_u64().map(|n| n as usize),
-            ).await;
+            )
+            .await;
             results.push(result);
         }
 
@@ -667,6 +649,30 @@ impl agentix::Tool for Tools {
             result["autocheck"] = ac.to_json();
         }
         result
+    }
+
+    /// Compare two files and return their differences.
+    async fn diff(&self, path1: String, path2: String) -> Value {
+        let text1 = std::fs::read_to_string(&path1).unwrap_or_default();
+        let text2 = std::fs::read_to_string(&path2).unwrap_or_default();
+        use similar::TextDiff;
+        let diff = TextDiff::from_lines(&text1, &text2);
+        let result = diff
+            .unified_diff()
+            .header(&format!("a/{path1}"), &format!("b/{path2}"))
+            .to_string();
+        if result.is_empty() {
+            json!({ "diff": "(no changes)" })
+        } else if result.len() > OUTPUT_LIMIT {
+            let mut cut = OUTPUT_LIMIT;
+            while !result.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let truncated = format!("{}... (truncated)", &result[..cut]);
+            json!({ "diff": truncated })
+        } else {
+            json!({ "diff": result })
+        }
     }
 }
 
