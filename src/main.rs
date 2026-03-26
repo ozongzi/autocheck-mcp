@@ -652,6 +652,8 @@ impl agentix::Tool for Tools {
     }
 
     /// Compare two files and return their differences.
+    /// path1: path to the first file
+    /// path2: path to the second file
     async fn diff(&self, path1: String, path2: String) -> Value {
         let text1 = std::fs::read_to_string(&path1).unwrap_or_default();
         let text2 = std::fs::read_to_string(&path2).unwrap_or_default();
