@@ -469,16 +469,11 @@ struct Tools;
 #[tool]
 impl agentix::Tool for Tools {
     /// Read multiple files or directories in one call to reduce round-trips.
-    /// reads_json: JSON array of objects, each with the same fields as the `read` tool:
+    /// Each item has the same fields as the `read` tool:
     ///   path (required), start_line, end_line, search_regex, context_lines, outline_only, extract_symbol, max_depth
-    async fn multiread(&self, reads_json: String) -> Value {
-        let arr: Vec<Value> = match serde_json::from_str(&reads_json) {
-            Ok(Value::Array(a)) => a,
-            _ => return json!({ "error": "reads_json must be a JSON array" }),
-        };
-
+    async fn multiread(&self, reads: Vec<Value>) -> Value {
         let mut results = Vec::new();
-        for item in &arr {
+        for item in &reads {
             let path = match item["path"].as_str() {
                 Some(p) => p.to_string(),
                 None => {
@@ -504,20 +499,15 @@ impl agentix::Tool for Tools {
     }
 
     /// Write multiple files in one call, then run checks (autocheck) for all affected projects once at the end.
-    /// writes_json: JSON array string. Each element has the same fields as the `write` tool:
+    /// Each item has the same fields as the `write` tool:
     ///   path (required), new_string (required), old_string, count, append, shebang
-    async fn multiwrite(&self, writes_json: String) -> Value {
-        let arr: Vec<Value> = match serde_json::from_str(&writes_json) {
-            Ok(Value::Array(a)) => a,
-            _ => return json!({ "error": "writes_json must be a JSON array" }),
-        };
-
+    async fn multiwrite(&self, writes: Vec<Value>) -> Value {
         let mut results = Vec::new();
         let mut affected: HashSet<(PathBuf, Language)> = HashSet::new();
 
         let mut failures: Vec<String> = Vec::new();
 
-        for item in &arr {
+        for item in &writes {
             let path = match item["path"].as_str() {
                 Some(p) => p.to_string(),
                 None => {

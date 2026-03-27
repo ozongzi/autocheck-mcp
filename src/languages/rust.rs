@@ -18,6 +18,22 @@ impl LanguageSupport for RustSupport {
     async fn run_check(&self, root: &Path, _file_path: Option<&Path>) -> CheckResult {
         let path_env = path_env_with_cargo();
 
+        // Backup all .rs files, run --fix to collect warnings, then revert
+        fn collect_rs(dir: &Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                    && let Ok(content) = std::fs::read_to_string(&path) {
+                        out.push((path, content));
+                    }
+            }
+        }
+        let mut snapshots: Vec<(std::path::PathBuf, String)> = Vec::new();
+        collect_rs(root, &mut snapshots);
+
         let fix = Command::new("cargo")
             .args(["clippy", "--fix", "--allow-dirty"])
             .current_dir(root)
@@ -25,6 +41,11 @@ impl LanguageSupport for RustSupport {
             .output()
             .await;
         let fix_ok = fix.is_ok_and(|o| o.status.success());
+
+        // Revert all files to their pre-fix state
+        for (path, content) in &snapshots {
+            let _ = std::fs::write(path, content);
+        }
 
         let check = Command::new("cargo")
             .args(["clippy", "--message-format=human"])
