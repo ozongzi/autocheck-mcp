@@ -22,3 +22,4 @@ futures = "0.3"
 async-trait = "0.1"
 similar = "2"
 regex = "1"
+reqwest = { version = "0.13", features = ["json"] }

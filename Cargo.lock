@@ -111,6 +111,7 @@ dependencies = [
  "async-trait",
  "futures",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",

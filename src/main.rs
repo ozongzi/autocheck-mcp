@@ -1,4 +1,4 @@
-use agentix::{McpServer, tool};
+use agentix::{LlmEvent, McpServer, Message, Provider, Request, tool};
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -668,11 +668,273 @@ impl agentix::Tool for Tools {
     }
 }
 
+// ── master tools (DeepSeek sub-agent) ────────────────────────────────────────
+
+const MASTER_READ_SYSTEM: &str = "\
+You are a precision file-intelligence sub-agent. Your sole purpose is to answer \
+the user's read goal with the highest possible accuracy.\n\
+\n\
+Mandatory rules — follow every one:\n\
+1. NEVER guess or invent file contents. Use the `read` tool before answering.\n\
+2. Prefer targeted reads: `search_regex`, `extract_symbol`, or line ranges over \
+   full-file reads when the goal is narrow.\n\
+3. Start with a directory read to orient yourself if the target path is unclear.\n\
+4. When the goal mentions a symbol or function, use `extract_symbol`.\n\
+5. Return ONLY verified content copied verbatim from the files — include file \
+   paths and line numbers so every claim is traceable.\n\
+6. If the content cannot be found after thorough searching, say so explicitly. \
+   Never hallucinate.\n\
+\n\
+RESPONSE FORMAT — this is an absolute constraint:\n\
+- Your entire response must be exactly one JSON object, nothing else.\n\
+- No markdown fences, no prose before or after, no explanation outside the object.\n\
+- Schema: {\"success\": <boolean>, \"description\": \"<string>\"}\n\
+- success=true  → description contains the exact content / findings.\n\
+- success=false → description explains why the content could not be found.\n\
+- Any text outside the JSON object will cause a hard parse failure.";
+
+const MASTER_WRITE_SYSTEM: &str = "\
+You are a precision file-editing sub-agent. Your sole purpose is to apply the \
+user's write goal as a minimal, correct change.\n\
+\n\
+Mandatory rules — follow every one:\n\
+1. Read the target file FIRST with the `read` tool to understand its exact \
+   current content and structure before generating any edit.\n\
+2. Use `write` in replace mode (`old_string` → `new_string`) for surgical edits. \
+   The `old_string` must be copied verbatim from the file — never paraphrase.\n\
+3. Make the smallest change that fully satisfies the goal. Do not refactor \
+   surrounding code unless the goal explicitly requires it.\n\
+4. After writing, re-read the modified region to verify the result looks correct.\n\
+5. If the goal is ambiguous, resolve it by reading first, then apply the most \
+   conservative interpretation.\n\
+\n\
+RESPONSE FORMAT — this is an absolute constraint:\n\
+- Your entire response must be exactly one JSON object, nothing else.\n\
+- No markdown fences, no prose before or after, no explanation outside the object.\n\
+- Schema: {\"success\": <boolean>, \"description\": \"<string>\"}\n\
+- success=true  → description summarises what was changed.\n\
+- success=false → description explains why the edit could not be applied.\n\
+- Any text outside the JSON object will cause a hard parse failure.";
+
+struct MasterTools {
+    api_key: String,
+}
+
+#[tool]
+impl agentix::Tool for MasterTools {
+    /// Semantic read: describe in plain language what you need to find or understand.
+    /// A DeepSeek sub-agent will use the `read` tool to locate and return the exact
+    /// content — it never guesses. Streams the agent's reasoning and tool calls live.
+    ///
+    /// goal: natural-language description of what to read, find, or summarize
+    #[streaming]
+    fn master_read(&self, goal: String) {
+        let api_key = self.api_key.clone();
+        async_stream::stream! {
+            use agentix::tool_trait::ToolOutput;
+            use futures::StreamExt;
+
+            let file_tools = Tools;
+            let raw_defs = file_tools.raw_tools();
+            let http = reqwest::Client::new();
+
+            let mut req = Request::new(Provider::DeepSeek, api_key)
+                .system_prompt(MASTER_READ_SYSTEM)
+                .user(format!("Read goal: {goal}"))
+                .tools(raw_defs)
+                .json();
+
+            loop {
+                let mut event_stream = match req.stream(&http).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield ToolOutput::Result(json!({ "error": format!("DeepSeek error: {e}") }));
+                        return;
+                    }
+                };
+
+                let mut tool_calls: Vec<agentix::request::ToolCall> = Vec::new();
+                let mut content = String::new();
+
+                while let Some(event) = event_stream.next().await {
+                    match event {
+                        LlmEvent::Token(t) => {
+                            yield ToolOutput::Progress(t.clone());
+                            content.push_str(&t);
+                        }
+                        LlmEvent::ToolCall(tc) => {
+                            tool_calls.push(tc);
+                        }
+                        LlmEvent::Error(e) => {
+                            yield ToolOutput::Result(json!({ "error": e }));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if tool_calls.is_empty() {
+                    // Try to parse the whole content, then fall back to extracting
+                    // the first {...} block in case the model leaked surrounding text.
+                    let result: Value = serde_json::from_str(&content).ok()
+                        .or_else(|| {
+                            let start = content.find('{')?;
+                            let end   = content.rfind('}')?;
+                            serde_json::from_str(&content[start..=end]).ok()
+                        })
+                        .unwrap_or_else(|| json!({ "success": false, "description": content }));
+                    yield ToolOutput::Result(result);
+                    return;
+                }
+
+                req = req.message(Message::Assistant {
+                    content: if content.is_empty() { None } else { Some(content) },
+                    reasoning: None,
+                    tool_calls: tool_calls.clone(),
+                });
+
+                for tc in &tool_calls {
+                    yield ToolOutput::Progress(format!("\n[tool:{}] {}\n", tc.name, tc.arguments));
+                    let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+                    let mut ts = file_tools.call(&tc.name, args).await;
+                    let mut result = Value::Null;
+                    while let Some(out) = ts.next().await {
+                        match out {
+                            ToolOutput::Progress(p) => yield ToolOutput::Progress(p),
+                            ToolOutput::Result(r) => result = r,
+                        }
+                    }
+                    req = req.message(Message::ToolResult {
+                        call_id: tc.id.clone(),
+                        content: result.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Semantic write: describe in plain language what change you want to make.
+    /// A DeepSeek sub-agent reads the target file first, then applies the minimal
+    /// correct edit using the `write` tool. Streams live progress and the autocheck result.
+    ///
+    /// Run a shell command and stream its output line by line.
+    /// command: the shell command to execute
+    /// timeout_ms: optional timeout in milliseconds
+    #[streaming]
+    fn bash(&self, command: String, timeout_ms: Option<u64>) {
+        async_stream::stream! {
+            use agentix::ToolOutput;
+            use futures::StreamExt;
+            let mut stream = run_bash_streaming(command, timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+            while let Some(item) = stream.next().await {
+                match item {
+                    BashOutput::Line(line) => yield ToolOutput::Progress(line),
+                    BashOutput::Done(result) => yield ToolOutput::Result(result),
+                }
+            }
+        }
+    }
+
+    /// goal: natural-language description of the edit — what to change and where
+    #[streaming]
+    fn master_write(&self, goal: String) {
+        let api_key = self.api_key.clone();
+        async_stream::stream! {
+            use agentix::tool_trait::ToolOutput;
+            use futures::StreamExt;
+
+            let file_tools = Tools;
+            let raw_defs = file_tools.raw_tools();
+            let http = reqwest::Client::new();
+
+            let mut req = Request::new(Provider::DeepSeek, api_key)
+                .system_prompt(MASTER_WRITE_SYSTEM)
+                .user(format!("Write goal: {goal}"))
+                .tools(raw_defs)
+                .json();
+
+            loop {
+                let mut event_stream = match req.stream(&http).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield ToolOutput::Result(json!({ "error": format!("DeepSeek error: {e}") }));
+                        return;
+                    }
+                };
+
+                let mut tool_calls: Vec<agentix::request::ToolCall> = Vec::new();
+                let mut content = String::new();
+
+                while let Some(event) = event_stream.next().await {
+                    match event {
+                        LlmEvent::Token(t) => {
+                            yield ToolOutput::Progress(t.clone());
+                            content.push_str(&t);
+                        }
+                        LlmEvent::ToolCall(tc) => {
+                            tool_calls.push(tc);
+                        }
+                        LlmEvent::Error(e) => {
+                            yield ToolOutput::Result(json!({ "error": e }));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if tool_calls.is_empty() {
+                    // Try to parse the whole content, then fall back to extracting
+                    // the first {...} block in case the model leaked surrounding text.
+                    let mut result: Value = serde_json::from_str(&content).ok()
+                        .or_else(|| {
+                            let start = content.find('{')?;
+                            let end   = content.rfind('}')?;
+                            serde_json::from_str(&content[start..=end]).ok()
+                        })
+                        .unwrap_or_else(|| json!({ "success": false, "description": content }));
+                    if result.get("success").and_then(Value::as_bool) == Some(true) {
+                        result.as_object_mut().map(|o| o.remove("description"));
+                    }
+                    yield ToolOutput::Result(result);
+                    return;
+                }
+
+                req = req.message(Message::Assistant {
+                    content: if content.is_empty() { None } else { Some(content) },
+                    reasoning: None,
+                    tool_calls: tool_calls.clone(),
+                });
+
+                for tc in &tool_calls {
+                    yield ToolOutput::Progress(format!("\n[tool:{}] {}\n", tc.name, tc.arguments));
+                    let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+                    let mut ts = file_tools.call(&tc.name, args).await;
+                    let mut result = Value::Null;
+                    while let Some(out) = ts.next().await {
+                        match out {
+                            ToolOutput::Progress(p) => yield ToolOutput::Progress(p),
+                            ToolOutput::Result(r) => result = r,
+                        }
+                    }
+                    req = req.message(Message::ToolResult {
+                        call_id: tc.id.clone(),
+                        content: result.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    McpServer::new(Tools)
-        .with_name("autocheck-mcp")
-        .serve_stdio()
-        .await?;
+    McpServer::new(MasterTools {
+        api_key: std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set"),
+    })
+    .with_name("autocheck-mcp")
+    .serve_stdio()
+    .await?;
     Ok(())
 }
