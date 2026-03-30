@@ -930,11 +930,12 @@ impl agentix::Tool for MasterTools {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    McpServer::new(MasterTools {
-        api_key: std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set"),
-    })
-    .with_name("autocheck-mcp")
-    .serve_stdio()
-    .await?;
+    // McpServer::new(MasterTools {
+    //     api_key: std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY must be set"),
+    // })
+    McpServer::new(Tools)
+        .with_name("autocheck-mcp")
+        .serve_stdio()
+        .await?;
     Ok(())
 }
