@@ -670,6 +670,7 @@ impl agentix::Tool for Tools {
 
 // ── master tools (DeepSeek sub-agent) ────────────────────────────────────────
 
+#[allow(dead_code)]
 const MASTER_READ_SYSTEM: &str = "\
 You are a precision file-intelligence sub-agent. Your sole purpose is to answer \
 the user's read goal with the highest possible accuracy.\n\
@@ -693,6 +694,7 @@ RESPONSE FORMAT — this is an absolute constraint:\n\
 - success=false → description explains why the content could not be found.\n\
 - Any text outside the JSON object will cause a hard parse failure.";
 
+#[allow(dead_code)]
 const MASTER_WRITE_SYSTEM: &str = "\
 You are a precision file-editing sub-agent. Your sole purpose is to apply the \
 user's write goal as a minimal, correct change.\n\
@@ -716,6 +718,7 @@ RESPONSE FORMAT — this is an absolute constraint:\n\
 - success=false → description explains why the edit could not be applied.\n\
 - Any text outside the JSON object will cause a hard parse failure.";
 
+#[allow(dead_code)]
 struct MasterTools {
     api_key: String,
 }
