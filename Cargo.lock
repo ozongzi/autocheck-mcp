@@ -4,7 +4,9 @@ version = 4
 
 [[package]]
 name = "agentix"
-version = "0.9.1"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f3b4b53efbba56311f52c8d1a1a29b06826a8a33b0978b8655ce1c2e84a272"
 dependencies = [
  "agentix-macros",
  "async-stream",
@@ -27,6 +29,8 @@ dependencies = [
 [[package]]
 name = "agentix-macros"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef266999e26cbcd39f0e0a9d022b7eba6bcc114bc79fe14f9e0f40e141cc9c2"
 dependencies = [
  "proc-macro2",
  "quote",
