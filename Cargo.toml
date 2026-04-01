@@ -1,6 +1,6 @@
 [package]
 name = "autocheck-mcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "MCP server for editing files with automatic check (Rust, Go, Python, JS/TS) after every write"
 license = "MIT OR Apache-2.0"
