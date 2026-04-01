@@ -1,5 +1,4 @@
 use agentix::{LlmEvent, McpServer, Message, Provider, Request, tool};
-use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Write;
@@ -172,8 +171,6 @@ async fn do_read(
     path: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
-    search_regex: Option<String>,
-    context_lines: Option<usize>,
     outline_only: Option<bool>,
     extract_symbol: Option<String>,
     max_depth: Option<usize>,
@@ -231,53 +228,6 @@ async fn do_read(
         }
         return json!({
             "error": format!("symbol '{}' not found", symbol),
-        });
-    }
-
-    // Search regex mode
-    if let Some(pattern) = search_regex {
-        let ctx = context_lines.unwrap_or(2);
-        let regex = match Regex::new(&pattern) {
-            Ok(r) => r,
-            Err(e) => return json!({ "error": format!("invalid regex: {e}") }),
-        };
-
-        let lines: Vec<&str> = content.lines().collect();
-        let mut matches = Vec::new();
-        let mut match_indices = HashSet::new();
-
-        for (i, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                match_indices.insert(i);
-                let start = i.saturating_sub(ctx);
-                let end = (i + ctx + 1).min(lines.len());
-                for j in start..end {
-                    matches.push((j, lines[j], j == i));
-                }
-            }
-        }
-
-        if matches.is_empty() {
-            return json!({ "matches": [], "total_matches": 0 });
-        }
-
-        // Remove duplicates and sort
-        let mut seen = HashSet::new();
-        let formatted: Vec<String> = matches
-            .into_iter()
-            .filter(|(idx, _, _)| seen.insert(*idx))
-            .map(|(idx, line, is_match)| {
-                let marker = if is_match { ">>>" } else { "   " };
-                format!("{:4} | {} {}", idx + 1, marker, line)
-            })
-            .collect();
-
-        return json!({
-            "type": "search",
-            "path": path,
-            "pattern": pattern,
-            "matches": formatted.join("\n"),
-            "total_matches": match_indices.len(),
         });
     }
 
@@ -468,9 +418,7 @@ struct Tools;
 
 #[tool]
 impl agentix::Tool for Tools {
-    /// Read multiple files or directories in one call to reduce round-trips.
-    /// Each item has the same fields as the `read` tool:
-    ///   path (required), start_line, end_line, search_regex, context_lines, outline_only, extract_symbol, max_depth
+    /// Read multiple files or directories in one call to reduce round-trips. Each item has the same fields as the `read` tool: path (required), start_line, end_line, outline_only, extract_symbol, max_depth
     async fn multiread(&self, reads: Vec<Value>) -> Value {
         let mut results = Vec::new();
         for item in &reads {
@@ -485,8 +433,6 @@ impl agentix::Tool for Tools {
                 &path,
                 item["start_line"].as_u64().map(|n| n as usize),
                 item["end_line"].as_u64().map(|n| n as usize),
-                item["search_regex"].as_str().map(str::to_string),
-                item["context_lines"].as_u64().map(|n| n as usize),
                 item["outline_only"].as_bool(),
                 item["extract_symbol"].as_str().map(str::to_string),
                 item["max_depth"].as_u64().map(|n| n as usize),
@@ -566,23 +512,11 @@ impl agentix::Tool for Tools {
         }
     }
 
-    /// Read, search, explore, or summarize files and directories.
-    /// Designed to provide maximum context without exceeding LLM token limits.
-    /// Always returns content prefixed with line numbers to assist future Write operations.
-    ///
-    /// Modes:
-    ///   - directory path → returns a tree view of the directory (configurable depth)
-    ///   - all modifiers omitted → read entire file (auto-truncates and warns if > max_lines)
-    ///   - start_line / end_line present → read a specific line range (for pagination)
-    ///   - search_regex present → grep mode: returns matched lines with `context_lines` around them
-    ///   - outline_only = true → returns file skeleton (imports, class/function signatures only) via AST
-    ///   - extract_symbol present → extracts the full body of a specific class or function via AST
+    /// Read, search, explore, or summarize files and directories. Designed to provide maximum context without exceeding LLM token limits. Always returns content prefixed with line numbers to assist future Write operations. Modes: - directory path → returns a tree view of the directory (configurable depth) - all modifiers omitted → read entire file (auto-truncates and warns if > max_lines) - start_line / end_line present → read a specific line range (for pagination) - outline_only = true → returns file skeleton (imports, class/function signatures only) via AST - extract_symbol present → extracts the full body of a specific class or function via AST
     ///
     /// path: absolute path to the file or directory
     /// start_line: optional starting line number (1-indexed)
     /// end_line: optional ending line number
-    /// search_regex: string or regex to search for in the file
-    /// context_lines: number of lines to show before and after a regex match (default: 2)
     /// outline_only: boolean, if true, parses code and returns only structural signatures
     /// extract_symbol: exact name of a function, class, or method to extract
     /// max_depth: maximum depth for directory tree view (default: 3, max: 5)
@@ -591,8 +525,6 @@ impl agentix::Tool for Tools {
         path: String,
         start_line: Option<usize>,
         end_line: Option<usize>,
-        search_regex: Option<String>,
-        context_lines: Option<usize>,
         outline_only: Option<bool>,
         extract_symbol: Option<String>,
         max_depth: Option<usize>,
@@ -601,13 +533,93 @@ impl agentix::Tool for Tools {
             &path,
             start_line,
             end_line,
-            search_regex,
-            context_lines,
             outline_only,
             extract_symbol,
             max_depth,
         )
         .await
+    }
+
+    /// A powerful search tool built on ripgrep.
+    ///
+    /// NEVER invoke `grep` or `rg` as a Bash command, use this tool instead.
+    /// The Grep tool has been optimized for correct permissions and access.
+    ///
+    /// - DO NOT USE MatchPerLine for initial searches that may have a large number of results. Use it only when you know it is a very specific, targeted search.
+    /// - By default, Query is treated as a regular expression. Set FixedStrings to true to treat Query as a literal string (no regex).
+    /// - Filter files with Includes parameter in glob format (e.g., "*.js", "**/*.tsx")
+    /// - If the result is truncated, you must narrow down your search using a more specific query or more filters.
+    ///
+    /// Query: the search term or pattern to look for within files
+    /// SearchPath: the path to search — can be a directory or a single file
+    /// Includes: glob patterns to filter files (e.g. "*.rs", "!**/target/*")
+    /// MatchPerLine: show surrounding file content together with matches instead of just file paths
+    /// CaseSensitive: if true, performs a case-sensitive search (default: false)
+    /// FixedStrings: if true, treats Query as a literal string with no regex (default: false)
+    async fn grep_search(
+        &self,
+        #[allow(non_snake_case)] Query: String,
+        #[allow(non_snake_case)] SearchPath: String,
+        #[allow(non_snake_case)] Includes: Option<Vec<String>>,
+        #[allow(non_snake_case)] MatchPerLine: Option<bool>,
+        #[allow(non_snake_case)] CaseSensitive: Option<bool>,
+        #[allow(non_snake_case)] FixedStrings: Option<bool>,
+    ) -> Value {
+        let mut cmd = vec!["rg".to_string(), "--line-number".to_string()];
+
+        if !CaseSensitive.unwrap_or(false) {
+            cmd.push("--ignore-case".to_string());
+        }
+        if FixedStrings.unwrap_or(false) {
+            cmd.push("--fixed-strings".to_string());
+        }
+        if MatchPerLine.unwrap_or(false) {
+            cmd.push("--context=2".to_string());
+        } else {
+            cmd.push("--files-with-matches".to_string());
+        }
+        for inc in Includes.unwrap_or_default() {
+            if let Some(pat) = inc.strip_prefix('!') {
+                cmd.push(format!("--glob=!{pat}"));
+            } else {
+                cmd.push(format!("--glob={inc}"));
+            }
+        }
+        cmd.push("--".to_string());
+        cmd.push(Query.clone());
+        cmd.push(SearchPath.clone());
+
+        let shell_cmd = cmd
+            .iter()
+            .map(|s| {
+                // Wrap each argument in single quotes, escaping embedded single quotes
+                let escaped = s.replace('\'', "'\\''" );
+                format!("'{escaped}'")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let result = run_bash(&shell_cmd, DEFAULT_TIMEOUT_MS).await;
+
+        if let Some(err) = result.get("error") {
+            return json!({ "error": err, "query": Query, "path": SearchPath });
+        }
+
+        let stdout = result["stdout"].as_str().unwrap_or("").trim().to_string();
+        let truncated = result.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+
+        if stdout.is_empty() {
+            return json!({ "matches": "", "total": 0, "query": Query, "path": SearchPath });
+        }
+
+        let lines: Vec<&str> = stdout.lines().collect();
+        json!({
+            "matches": stdout,
+            "total": lines.len(),
+            "truncated": truncated,
+            "query": Query,
+            "path": SearchPath,
+        })
     }
 
     /// Write to a file (overwrite / replace / append), then run language-specific check (autocheck).
